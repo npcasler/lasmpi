@@ -179,7 +179,9 @@ Library.
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <float.h>
 #include <vector>
+#include <limits>
 
 using namespace std;
 
@@ -195,6 +197,11 @@ int NNodes,  /* number of nodes in computation*/
     N,  /* Lidar points processed */
     Me;  /* my node number */
 
+double xmin,xmax,ymin,ymax; /* Edges of lidar tile */
+int xgrid,ygrid; /* Size of x,y grid */
+double grid_size; /* Size of square grid */
+char* out_file; /* Output file parameter */
+
 /*******************************/
 /* Read all data into a vector */
 /*******************************/
@@ -205,15 +212,29 @@ void Read_LAS_file(const char* las_name)
 	double* coords;
 	printf("Attempting file read on Node %d\n",Me);
 	
+	xmin = DBL_MAX;
+	xmax = DBL_MIN;
+	ymin = DBL_MAX;
+	ymax = DBL_MIN;
+
 	do
 	{
 		laspoint = LASReader_GetNextPoint(reader);
 		if(LASPoint_GetClassification(laspoint)==2)
 		{
 			coords = new double[3];
-			coords[0] = LASPoint_GetX(laspoint);
-			coords[1] = LASPoint_GetY(laspoint);
-			coords[2] = LASPoint_GetZ(laspoint);
+			double x = LASPoint_GetX(laspoint);
+			double y = LASPoint_GetY(laspoint);
+			double z = LASPoint_GetZ(laspoint);
+
+			xmin = min<double>(xmin,x);
+			ymin = min<double>(ymin,y);
+			xmax = max<double>(xmax,x);
+			ymax = max<double>(ymax,y);
+
+			coords[0] = x;
+			coords[1] = y;
+			coords[2] = z;
 			las_points.push_back(coords);
 		}
 		//las_points.push_back(LASPoint_Copy(laspoint));
@@ -221,6 +242,7 @@ void Read_LAS_file(const char* las_name)
 	
 	LASReader_Destroy(reader);
 	printf("Finished reading %d points on Node %d\n",las_points.size(),Me);
+	printf("Lidar limits MinX: %f, MaxX: %f, MinY %f, MaxY %f\n",xmin,xmax,ymin,ymax);
 }
 
 /******************************************/
@@ -249,16 +271,24 @@ void Init(int argc, char ** argv)
 	MPI_Init(&argc,&argv);
 
 	/* Get the name of the LIDAR File to be processed */
-	char* las_name = argv[1];	
-	char* out_name = argv[2];
-	double grid_size = atof(argv[3]);
+	char* las_name = argv[1];
+	/* Get the name of the output raster file */
+	out_file = argv[2];
+	/* Get the size of the requested output grid */
+	grid_size = atof(argv[3]);
 
 	/* puts the number of nodes in NNodes */
 	MPI_Comm_size(MPI_COMM_WORLD,&NNodes);
 	/* puts the node number of this node in Me */
 	MPI_Comm_rank(MPI_COMM_WORLD,&Me);
 
+	/* Las data is only needed on intermediate nodes */
 	Read_LAS_file(las_name);
+
+	xgrid = (int)ceill((xmax-xmin)/grid_size);
+	ygrid = (int)ceill((ymax-ymin)/grid_size);
+
+	printf("Outsize Xgrid: %d Ygrid %d:\n",xgrid,ygrid);
 }
 
 /**************************************/
@@ -266,6 +296,7 @@ void Init(int argc, char ** argv)
 /**************************************/
 void Finalize()
 {
+	/* Las data is only needed on intermediate nodes */
 	Destroy_LAS_Vector();
 	MPI_Finalize();
 }
@@ -277,7 +308,20 @@ void Finalize()
 /*******************************************/
 void NodeN()
 {
-
+	int loop_limit = xgrid*ygrid;
+	double test_point[3];
+	double* out_grid = (double*)malloc(loop_limit*sizeof(double));
+	MPI_Status Status;  /* see below */
+	FILE* f = fopen(out_file,"wb");
+	for(int i=0;i<loop_limit;i++)
+	{
+		MPI_Recv(test_point,3,MPI_DOUBLE,MPI_ANY_SOURCE,PIPE_MSG,MPI_COMM_WORLD,&Status);
+		int xoff = (int)(test_point[0]-xmin)/grid_size;
+		int yoff = (int)(test_point[1]-ymin)/grid_size;
+		out_grid[xoff+yoff*xgrid] = test_point[2];
+	}
+	fwrite(out_grid,sizeof(double),xgrid*ygrid,f);
+	fclose(f);
 }
 
 /*******************************************/
@@ -287,7 +331,52 @@ void NodeN()
 /*******************************************/
 void NodeArb()
 {
+	int data_size = las_points.size();
+	double test_point[3];
+	int nodes_in_play = NNodes-2;
+	MPI_Status status;  /* see below */ 
+	int Error;
+	//Receive points till end and calculate distance to N-th other points
+	//for(int i=0;i<=data_size-nodes_in_play;i+=nodes_in_play)
+	while(1)
+	{
+		Error = MPI_Recv(test_point,2,MPI_DOUBLE,0,MPI_ANY_TAG,MPI_COMM_WORLD,&status);
+		//Error in RECV break
+		if(Error != MPI_SUCCESS) break;
+		//End of points break;
+		if(status.MPI_TAG == END_MSG) break;
+	
+		double wt_sum = 0.0;
+		double z_wt_sum = 0.0;
+		double grid_circle = grid_size*10.0;
 
+		for(int i=0;i<data_size;i++)
+		{
+			double xdiff = las_points[i][0]-test_point[0];
+			double ydiff = las_points[i][1]-test_point[1];
+
+			double dist_sqr = xdiff*xdiff + ydiff*ydiff;
+
+			double dist = sqrt(dist_sqr);
+			
+			//Accumulate points in a ring
+			if(dist<grid_circle)
+			{
+				double z = las_points[i][2];
+				wt_sum += 1.0/dist_sqr;
+				z_wt_sum += z*1.0/dist_sqr;
+			}
+		}
+		
+		double zest = z_wt_sum/wt_sum;
+		
+		//If no points in vicinity and estimation failed put a zero
+		if(zest!=zest) zest = 0;
+
+		test_point[2] = zest;
+		//Send off result to serialized node
+		Error = MPI_Send(test_point,3,MPI_DOUBLE,NNodes-1,PIPE_MSG,MPI_COMM_WORLD);
+	}
 }
 
 /**********************************************/
@@ -297,7 +386,34 @@ void NodeArb()
 /**********************************************/
 void Node0()
 {
+	double point[2];
+	unsigned int robin_count = 0;
 
+	//MPI_Status status;  /* see below */ 
+	int Error;
+	
+	int nodes_in_play = NNodes-2;
+
+	for(int i = 0;i < ygrid; i++)
+	{
+		for(int j = 0;j < xgrid; j++)
+		{
+			point[0] = xmin + grid_size*j;
+			point[1] = ymin + grid_size*i;
+			
+			int dest = robin_count%(nodes_in_play)+1;
+
+			Error = MPI_Send(point,2,MPI_DOUBLE,dest,PIPE_MSG,MPI_COMM_WORLD);
+
+			robin_count++;
+		}
+	}
+	//Done with all points send end-msg
+	for(int dest=1;dest<NNodes-1;dest++)
+	{
+		printf("Stopping %d\n",dest);
+		Error = MPI_Send(point,2,MPI_DOUBLE,dest,END_MSG,MPI_COMM_WORLD);
+	}	
 }
 
 /****************************************/
