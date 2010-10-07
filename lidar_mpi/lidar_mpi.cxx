@@ -278,10 +278,10 @@ void Finalize()
 }
 
 /****************************************************/
-/* NodeArb processes every element in the vector      */
+/* NodeArb processes every element in the vector    */
 /* to calculate distance from received element      */
 /* and generate a prediction of height using points */
-/* withing 5 units                                  */
+/* within 5 units                                   */
 /****************************************************/
 void NodeArb()
 {
