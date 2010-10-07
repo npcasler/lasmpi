@@ -195,12 +195,7 @@ using namespace std;
 
 int NNodes,  /* number of nodes in computation*/
     N,  /* Lidar points processed */
-    Me,  /* my node number */
-    ToCheck;  /* current number to check for passing on to next node;
-                 stylistically this might be nicer as a local in
-		 Node*(), but I have placed it here to dramatize
-		 the fact that the globals are NOT shared among
-		 the nodes, thus no problem */
+    Me;  /* my node number */
 
 double T1,T2;  /* start and finish times */
 
