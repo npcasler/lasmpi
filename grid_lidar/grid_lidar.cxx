@@ -193,6 +193,9 @@ using namespace std;
 typedef double* point_data_t;
 vector<point_data_t> las_points;
 
+/* Grid to hold data for quicker random access */
+vector<vector<point_data_t>> las_point_grid;
+
 int NNodes,  /* number of nodes in computation*/
     N,  /* Lidar points processed */
     Me;  /* my node number */
@@ -241,8 +244,39 @@ void Read_LAS_file(const char* las_name)
 	}while(laspoint != NULL);
 	
 	LASReader_Destroy(reader);
-	printf("Finished reading %d points on Node %d\n",las_points.size(),Me);
+	printf("Finished reading %d points on Node %l\n",las_points.size(),Me);
 	printf("Lidar limits MinX: %f, MaxX: %f, MinY %f, MaxY %f\n",xmin,xmax,ymin,ymax);
+}
+
+/*******************************************************/
+/* This routine is designed to generate a grid		   */
+/* corresponding to requested sampling to ease random  */
+/* access											   */
+/*******************************************************/
+void Cache_grid_las()
+{
+	long total_cache_grid = xgrid*ygrid;
+	vector<point_data_t>::iterator pointVecIterator;
+
+	//Populate the vector cache
+	for(long i=0;i<total_cache_grid;i++)
+	{
+		las_point_grid.push_back(vector<double*>());
+	}
+
+	
+
+	for(pointVecIterator = las_points.begin(); 
+        pointVecIterator != las_points.end();
+        pointVecIterator++)
+	{
+		double* test_point = *pointVecIterator;
+		int xoff = (int)ceill((test_point[0]-xmin)/grid_size);
+		int yoff = (int)ceill((test_point[1]-ymin)/grid_size);
+
+		int grid_offset = xoff+yoff*xgrid;
+		las_point_grid[grid_offset].push_back(test_point);
+	}
 }
 
 /******************************************/
@@ -285,10 +319,13 @@ void Init(int argc, char ** argv)
 	/* Las data is only needed on intermediate nodes */
 	Read_LAS_file(las_name);
 
-	xgrid = (int)ceill((xmax-xmin)/grid_size);
-	ygrid = (int)ceill((ymax-ymin)/grid_size);
+	/* Pad up to make sure we cover the edge */
+	xgrid = (int)ceill((xmax-xmin)/grid_size)+1;
+	ygrid = (int)ceill((ymax-ymin)/grid_size)+1;
 
 	printf("Outsize Xgrid: %d Ygrid %d:\n",xgrid,ygrid);
+
+	Cache_grid_las();
 }
 
 /**************************************/
@@ -316,9 +353,9 @@ void NodeN()
 	for(int i=0;i<loop_limit;i++)
 	{
 		MPI_Recv(test_point,3,MPI_DOUBLE,MPI_ANY_SOURCE,PIPE_MSG,MPI_COMM_WORLD,&Status);
-		int xoff = (int)(test_point[0]-xmin)/grid_size;
-		int yoff = (int)(test_point[1]-ymin)/grid_size;
-		out_grid[xoff+yoff*xgrid] = test_point[2];
+		int xoff = (int)ceill((test_point[0]-xmin)/grid_size);
+		int yoff = (int)ceill((test_point[1]-ymax)/grid_size);
+		out_grid[xoff+abs(yoff)*xgrid] = test_point[2];
 	}
 	fwrite(out_grid,sizeof(double),xgrid*ygrid,f);
 	fclose(f);
@@ -350,10 +387,30 @@ void NodeArb()
 		double z_wt_sum = 0.0;
 		double grid_circle = grid_size*10.0;
 
-		for(int i=0;i<data_size;i++)
+		int xoff_test = (int)ceill((test_point[0]-xmin)/grid_size);
+		int yoff_test = (int)ceill((test_point[1]-ymin)/grid_size);
+
+		vector<double*> las_points_local;
+
+		for(int m = xoff_test-11;m < xoff_test+11;m++)
 		{
-			double xdiff = las_points[i][0]-test_point[0];
-			double ydiff = las_points[i][1]-test_point[1];
+			for(int n = yoff_test-11;n < yoff_test+11;n++)
+			{
+				int m_bound = min(max(0,m),xgrid-1);
+				int n_bound = min(max(0,n),ygrid-1);
+				
+				//printf("Edges %d %d\n",m,n);
+				
+				las_points_local.insert(las_points_local.end(),
+					las_point_grid[m_bound+xgrid*n_bound].begin(),
+					las_point_grid[m_bound+xgrid*n_bound].end());
+			}
+		}
+
+		for(unsigned int i=0;i<las_points_local.size();i++)
+		{
+			double xdiff = las_points_local[i][0]-test_point[0];
+			double ydiff = las_points_local[i][1]-test_point[1];
 
 			double dist_sqr = xdiff*xdiff + ydiff*ydiff;
 
@@ -367,7 +424,7 @@ void NodeArb()
 				z_wt_sum += z*1.0/dist_sqr;
 			}
 		}
-		
+
 		double zest = z_wt_sum/wt_sum;
 		
 		//If no points in vicinity and estimation failed put a zero
