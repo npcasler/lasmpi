@@ -4,3 +4,4 @@ PROJECT(mpi_tests)
 
 ADD_SUBDIRECTORY(lidar_mpi)
 ADD_SUBDIRECTORY(grid_lidar)
+ADD_SUBDIRECTORY(reclass_lidar)
