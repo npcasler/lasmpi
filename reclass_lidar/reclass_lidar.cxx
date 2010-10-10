@@ -194,8 +194,7 @@ using namespace std;
 
 typedef LASPointH point_data_t;
 vector<point_data_t> las_points;
-void* maskArr;
-void* bufArr;
+
 
 char* las_out_file; /* LAS Output file parameter */
 LASWriterH las_writer; /* Handle to LASWriter Valid only on NodeN */
@@ -205,6 +204,13 @@ int NNodes,  /* number of nodes in computation*/
     Me;  /* my node number */
 
 double add_back_threshold;
+
+
+/* GDAL data buffers */
+void* maskArr;
+void* bufArr;
+int xsize,ysize;
+double transform[6];
 
 /****************************************/
 /* Initiate GDAL files for reading		*/
@@ -222,8 +228,10 @@ void Read_GDAL_files(const char* mask_file_name, const char* buffer_file_name)
 
 	if(maskDataset!=NULL && bufferDataset!=NULL)
 	{
-		int xsize = maskDataset->GetRasterXSize();
-		int ysize = maskDataset->GetRasterYSize();
+		xsize = maskDataset->GetRasterXSize();
+		ysize = maskDataset->GetRasterYSize();
+
+		maskDataset->GetGeoTransform(transform);
 
 		CPLAssert( maskDataset->GetRasterBand(1)->GetRasterDataType() == GDT_Byte );
 		CPLAssert( bufferDataset->GetRasterBand(1)->GetRasterDataType() == GDT_Byte );
@@ -358,7 +366,57 @@ void Finalize()
 /******************************************/
 void Node0()
 {
+	unsigned int data_size = las_points.size();
+	int nodes_in_play = NNodes-2;
 
+	//MPI_Status status;  /* see below */ 
+	int Error;
+
+	int dummy[2];
+
+	for(unsigned int i = 0; i< data_size; i++)
+	{
+		/* Should really do something more useful here */
+		/* Like look up GDAL array for whether it is in */
+		/* Mask or Buffer or outside both but w/e */
+		int dest = i%nodes_in_play + 1;
+		dummy[0] = i;
+		LASPointH test_point = las_points[i];
+		
+		double xloc = LASPoint_GetX(test_point);
+		double yloc = LASPoint_GetY(test_point);
+
+		int xoff = (int)ceil((xloc-transform[0])/transform[1]);
+		int yoff = (int)ceil((yloc-transform[3])/transform[5]);
+
+		/******************************************/
+		/* What to do with LASPoint			      */
+		/* 0 - pass it on to written		      */
+		/* 1 - we are in mask do something !!     */
+		/* 2 - we are in buffer save me and write */
+		/******************************************/
+		int decision = 0;
+		/* Ensure xoff/yoff is in range */
+		if(xoff<xsize && yoff <ysize && xoff>0 && yoff>0)
+		{
+			GByte mask = ((GByte*)maskArr)[xoff+yoff*xsize];
+			GByte buffer = ((GByte*)bufArr)[xoff+yoff*xsize];
+
+			if(mask == 255) decision = 1;
+			else if(buffer == 255) decision = 2;
+		}
+
+		dummy[2] = decision;
+
+		Error = MPI_Send(dummy,2,MPI_INTEGER,dest,PIPE_MSG,MPI_COMM_WORLD);
+	}
+
+	//Done with all points send end-msg
+	for(int dest=1;dest<NNodes-1;dest++)
+	{
+		printf("Stopping %d\n",dest);
+		Error = MPI_Send(dummy,2,MPI_INTEGER,dest,END_MSG,MPI_COMM_WORLD);
+	}
 }
 
 /******************************************/
@@ -369,7 +427,48 @@ void Node0()
 /******************************************/
 void NodeArb()
 {
+	int data_size = las_points.size();
+	int nodes_in_play = NNodes-2;
+	MPI_Status status;  /* see below */ 
+	int Error;
 
+	int test_data[2];
+
+	vector<int>  mask_points;
+	vector<int> buffer_points;
+
+	while(1)
+	{
+		Error = MPI_Recv(test_data,2,MPI_INTEGER,0,MPI_ANY_TAG,MPI_COMM_WORLD,&status);
+		//Error in RECV break
+		if(Error != MPI_SUCCESS) break;
+		//End of points break;
+		if(status.MPI_TAG == END_MSG) break;
+
+		if (test_data[1] == 0)
+		{
+			test_data[1] = 2;
+			Error = MPI_Send(test_data,2,MPI_INTEGER,NNodes-1,PIPE_MSG,MPI_COMM_WORLD);
+		}
+		else if(test_data[1] == 1)
+		{
+			mask_points.push_back(test_data[0]);
+		}
+		else if(test_data[1] == 2)
+		{
+			test_data[1] = 2;
+			buffer_points.push_back(test_data[0]);
+			Error = MPI_Send(test_data,2,MPI_INTEGER,NNodes-1,PIPE_MSG,MPI_COMM_WORLD);
+		}
+	}
+
+	for(unsigned int i=0;i<mask_points.size();i++)
+	{
+		LASPointH test_point = las_points[mask_points[i]];
+		test_data[0] = i;
+		test_data[1] = 3;
+		Error = MPI_Send(test_data,2,MPI_INTEGER,NNodes-1,PIPE_MSG,MPI_COMM_WORLD);
+	}
 }
 
 /*******************************************/
@@ -381,9 +480,18 @@ void NodeArb()
 void NodeN()
 {
 	unsigned int data_size = las_points.size();
-	for(unsigned int i=0;i<data_size;i++)
+	int test_data[2];
+	MPI_Status Status;
+	for(unsigned int i=0;i<data_size-1;i++)
 	{
-		LASWriter_WritePoint(las_writer,las_points[i]);
+		MPI_Recv(test_data,2,MPI_INTEGER,MPI_ANY_SOURCE,PIPE_MSG,MPI_COMM_WORLD,&Status);
+		int test_index = test_data[0];
+		int test_class = test_data[1];
+
+		LASPointH test_point = las_points[test_index];
+
+		LASPoint_SetClassification(test_point,test_class);
+		LASWriter_WritePoint(las_writer,test_point);
 	}
 }
 
