@@ -420,6 +420,8 @@ void Init(int argc, char ** argv)
 /**************************************/
 void Finalize()
 {
+	/* GDAL data array can freed earlier than this */
+	Destroy_GDAL_Array();
 	/* Las data is only needed on intermediate nodes */
 	Destroy_LAS_Vector();
 	MPI_Finalize();
@@ -467,6 +469,11 @@ void NodeN()
 	int test_data[2];
 	MPI_Status Status;
 	int Error;
+
+	for(unsigned int i=0;i<data_size;i++)
+	{
+		LASWriter_WritePoint(las_writer,las_mask_points[i]);
+	}
 }
 
 /****************************************/
