@@ -386,6 +386,42 @@ void Destroy_LAS_Vector()
 
 
 /***********************************************/
+/* Estimate IDW2 Height - Given a LASPoint	   */
+/* estimate the height by scanning through all */
+/* the buffer points and performing IDW2 based */
+/* estimate, then difference to original       */
+/***********************************************/
+double Estimate_las_difference(int mask_index)
+{
+	unsigned int loop_size = las_buffer_points.size();
+	LASPointH test_point = las_mask_points[mask_index];
+	double xtest = LASPoint_GetX(test_point);
+	double ytest = LASPoint_GetY(test_point);
+	double ztest = LASPoint_GetZ(test_point);
+	
+	double z_wt_sum = 0.0;
+	double wt_sum = 0.0;
+
+	for(unsigned int i=0;i<loop_size;i++)
+	{
+		LASPointH buf_point = las_buffer_points[i];
+		double xbuf = LASPoint_GetX(buf_point);
+		double ybuf = LASPoint_GetY(buf_point);
+		double zbuf = LASPoint_GetZ(buf_point);
+
+		double xdiff = xbuf-xtest;
+		double ydiff = ybuf-ytest;
+		double wt = 1/(xdiff*xdiff + ydiff*ydiff);
+		double z_wt = zbuf*wt;
+
+		wt_sum += wt;
+		z_wt_sum += z_wt;
+	}
+
+	return fabs(ztest-(z_wt_sum/wt_sum));
+}
+
+/***********************************************/
 /* Initialize the MPI blocks with arguments    */
 /***********************************************/
 void Init(int argc, char ** argv)
@@ -427,22 +463,6 @@ void Finalize()
 	MPI_Finalize();
 }
 
-
-/******************************************/
-/* Node0 sends ground points off to other */
-/* Nodes for consideration against masks, */
-/* IDW estimates etc					  */
-/******************************************/
-void Node0()
-{
-	unsigned int data_size = las_mask_points.size();
-	int nodes_in_play = NNodes-2;
-
-	//MPI_Status status;  /* see below */ 
-	int Error;
-
-}
-
 /******************************************/
 /* NodeArb Receives LASPoints and decides */
 /* Whether to send them off to be written */
@@ -451,10 +471,33 @@ void Node0()
 /******************************************/
 void NodeArb()
 {
-	int data_size = las_buffer_points.size();
-	int nodes_in_play = NNodes-2;
-	MPI_Status Status;  /* see below */ 
+	int buf_size = las_buffer_points.size();
 	int Error;
+
+	unsigned long mask_size = las_mask_points.size();
+	int nodes_in_play = NNodes-1;
+	unsigned long dummy[2];
+
+	for(unsigned long i=0;i<mask_size;i++)
+	{
+		if((i%nodes_in_play)==0)
+		{
+			dummy[0] = 0l;
+			double est_diff = Estimate_las_difference(i);
+			if (est_diff<add_back_threshold)
+			{
+				//Class does not need change still ground
+				dummy[1]=2;
+				Error = MPI_Send(dummy,2,MPI_UINT64_T,NNodes-1,PIPE_MSG,MPI_COMM_WORLD);
+			}
+			else
+			{
+				//We are in a hole or tree, can't recognize holes yet
+				dummy[1]=3;
+				Error = MPI_Send(dummy,2,MPI_UINT64_T,NNodes-1,PIPE_MSG,MPI_COMM_WORLD);
+			}
+		}
+	}
 }
 
 /*******************************************/
@@ -465,14 +508,20 @@ void NodeArb()
 /*******************************************/
 void NodeN()
 {
-	unsigned int data_size = las_mask_points.size();
-	int test_data[2];
+	unsigned long data_size = las_mask_points.size();
 	MPI_Status Status;
 	int Error;
+	
+	unsigned long dummy[2];
 
-	for(unsigned int i=0;i<data_size;i++)
+	for(unsigned long i=0;i<data_size;i++)
 	{
-		LASWriter_WritePoint(las_writer,las_mask_points[i]);
+		Error = MPI_Recv(dummy,2,MPI_UINT64_T,MPI_ANY_SOURCE,PIPE_MSG,MPI_COMM_WORLD,&Status);
+		int new_class = dummy[1];
+		unsigned long index = dummy[0];
+		LASPointH test_point = las_mask_points[index];
+		LASPoint_SetClassification(test_point,new_class);
+		LASWriter_WritePoint(las_writer,test_point);
 	}
 }
 
@@ -482,11 +531,7 @@ void NodeN()
 /****************************************/
 void NodeJobs()
 {
-	if(Me==0)
-	{
-		Node0();
-	}
-	else if(Me==NNodes-1)
+	if(Me==NNodes-1)
 	{
 		NodeN();
 	}
